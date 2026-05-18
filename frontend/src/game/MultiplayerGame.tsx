@@ -13,8 +13,9 @@ import type { PlayerRef, LaserState, Particle } from './Game'
 import { playLaser, playExplosion, playHit, startEngine, updateEngine, stopEngine } from './audio'
 import {
   DEFAULT_BEHAVIOR, applyBehavior, buildGameContext, localFallback, BEHAVIOR_TTL_MS,
+  makeBehaviorState,
 } from './BehaviorEngine'
-import type { Behavior, EnemyInfo } from './BehaviorEngine'
+import type { Behavior, EnemyInfo, BehaviorState } from './BehaviorEngine'
 import PromptSidebar from './PromptSidebar'
 
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
@@ -82,8 +83,9 @@ interface LoopProps {
 
 function MPGameLoop(p: LoopProps) {
   const { camera } = useThree()
-  const hudCd  = useRef(0)
-  const sendCd = useRef(0)
+  const hudCd           = useRef(0)
+  const sendCd          = useRef(0)
+  const behaviorStateRef = useRef<BehaviorState>(makeBehaviorState())
   const camPos  = useRef(new THREE.Vector3(0, 13, 12))
   const camLook = useRef(new THREE.Vector3(0, 0, -3))
   const tCam   = useRef(new THREE.Vector3())
@@ -109,6 +111,7 @@ function MPGameLoop(p: LoopProps) {
       p.behaviorRef.current,
       pl.x, pl.z, pl.vx, pl.vz, pl.heading,
       enemies,
+      behaviorStateRef.current,
     )
     p.boostRef.current = boost
     updateEngine(thrusting, boost)
@@ -313,7 +316,14 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const raw = await res.json()
-      const behavior: Behavior = { ...raw, expiresAt: Date.now() + BEHAVIOR_TTL_MS }
+      const behavior: Behavior = {
+        mode:              raw.mode              ?? 'chase',
+        targetMode:        raw.target_mode       ?? 'nearest',
+        aggression:        raw.aggression        ?? 0.7,
+        preferredDistance: raw.preferred_distance ?? 12,
+        description:       raw.description       ?? 'Executing order...',
+        expiresAt:         Date.now() + BEHAVIOR_TTL_MS,
+      }
       behaviorRef.current = behavior
       setCurrentBehavior(behavior)
     } catch {

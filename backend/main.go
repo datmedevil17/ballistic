@@ -64,17 +64,31 @@ type groqResponse struct {
 	} `json:"choices"`
 }
 
-const systemPrompt = `You are a spaceship AI controller in a multiplayer battle arena game.
-Parse the player's natural language instruction and return ONLY a JSON object with exactly these fields:
+const systemPrompt = `You are a spaceship AI pilot controller in a real-time multiplayer battle arena.
+Translate the player's natural-language order into a JSON behavior object.
+
+REQUIRED FIELDS (output ONLY this JSON, no markdown, no extra text):
 {"mode":"...","target_mode":"...","aggression":0.0,"preferred_distance":0,"description":"..."}
 
-mode must be exactly one of: idle, chase, strafe, aggressive, retreat, snipe, dodge, patrol
-target_mode must be exactly one of: nearest, weakest, strongest, random
-aggression is a float between 0.0 and 1.0
-preferred_distance is an integer between 5 and 30
-description is a short string (max 60 chars) describing what the ship will do
+FIELD RULES:
+- mode: one of exactly: idle | chase | strafe | aggressive | retreat | snipe | dodge | patrol
+- target_mode: one of exactly: nearest | weakest | strongest | random
+- aggression: float 0.0–1.0 (0=passive, 1=berserker)
+- preferred_distance: integer 5–30 (units; chase/aggressive≈8, strafe≈12, snipe≈22, retreat≈28)
+- description: ≤60 chars, plain English, describes what ship will do
 
-No markdown, no explanation, no extra keys. Only the raw JSON object.`
+EXAMPLES:
+"hunt the weakest ship" → {"mode":"chase","target_mode":"weakest","aggression":0.9,"preferred_distance":8,"description":"Hunting the weakest ship relentlessly"}
+"orbit and strafe" → {"mode":"strafe","target_mode":"nearest","aggression":0.7,"preferred_distance":12,"description":"Orbiting and strafing the nearest target"}
+"snipe from far away" → {"mode":"snipe","target_mode":"nearest","aggression":0.55,"preferred_distance":22,"description":"Sniping from long range"}
+"full aggro on the biggest target" → {"mode":"aggressive","target_mode":"strongest","aggression":1.0,"preferred_distance":7,"description":"Full aggression on strongest enemy"}
+"dodge and return fire" → {"mode":"dodge","target_mode":"nearest","aggression":0.5,"preferred_distance":12,"description":"Evading fire while returning shots"}
+"fall back and retreat" → {"mode":"retreat","target_mode":"nearest","aggression":0.15,"preferred_distance":28,"description":"Retreating from all threats"}
+"patrol the arena" → {"mode":"patrol","target_mode":"nearest","aggression":0.4,"preferred_distance":14,"description":"Patrolling and engaging opportunistically"}
+"chase down a random target" → {"mode":"chase","target_mode":"random","aggression":0.75,"preferred_distance":9,"description":"Chasing a random target"}
+
+Use the battlefield context (if provided) to refine aggression and distance based on HP and enemy count.
+Output ONLY the JSON object. No explanation.`
 
 func callGroq(prompt string, aiTier int, contextJSON json.RawMessage) (*BehaviorResponse, error) {
 	apiKey := os.Getenv("GROQ_API_KEY")

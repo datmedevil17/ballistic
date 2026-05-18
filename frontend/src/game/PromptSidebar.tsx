@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import type { Behavior } from './BehaviorEngine'
+import { BEHAVIOR_TTL_MS } from './BehaviorEngine'
 
 const COOLDOWN_SECS = 20
 
@@ -23,27 +24,49 @@ const TIER_LABEL: Record<number, string> = {
 }
 const TIER_INFO = [
   { tier: 1, label: 'Own position + HP', color: '#06b6d4' },
-  { tier: 2, label: 'Nearby enemies (≤30u)', color: '#8b5cf6' },
-  { tier: 3, label: 'All enemies + velocities', color: '#f59e0b' },
+  { tier: 2, label: 'Nearby enemies (≤35u)', color: '#8b5cf6' },
+  { tier: 3, label: 'All enemies + headings', color: '#f59e0b' },
 ]
 
 const MODE_TIPS: Record<string, string> = {
-  idle:       'Ship is idle',
-  chase:      'Chasing target',
+  idle:       'Idle',
+  chase:      'Chasing',
   strafe:     'Orbiting & strafing',
   aggressive: 'Full aggression',
   retreat:    'Retreating',
-  snipe:      'Long-range sniping',
-  dodge:      'Evading & returning fire',
-  patrol:     'Patrolling arena',
+  snipe:      'Long-range snipe',
+  dodge:      'Evading & firing',
+  patrol:     'Patrolling',
 }
+
+const PRESETS = [
+  { label: 'HUNT WEAK',  prompt: 'Hunt the weakest enemy — stay close and finish them off' },
+  { label: 'FULL AGGRO', prompt: 'Go fully aggressive on the nearest enemy, attack without mercy' },
+  { label: 'ORBIT',      prompt: 'Orbit and strafe the nearest enemy, keep moving to dodge fire' },
+  { label: 'SNIPE',      prompt: 'Hold long range and snipe enemies from a safe distance' },
+  { label: 'RETREAT',    prompt: 'Retreat and flee from all enemies immediately' },
+]
 
 export default function PromptSidebar({ aiTier, currentBehavior, onSubmit, submitting, error }: Props) {
   const [prompt, setPrompt]     = useState('')
   const [cooldown, setCooldown] = useState(0)
+  const [ttlLeft,  setTtlLeft]  = useState(0)   // seconds remaining on current behavior
   const cdRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const canSubmit = !submitting && cooldown <= 0 && prompt.trim().length > 0
+
+  // track TTL of active behavior
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (currentBehavior.mode === 'idle' || currentBehavior.expiresAt === Infinity) {
+        setTtlLeft(0)
+        return
+      }
+      const left = Math.max(0, Math.ceil((currentBehavior.expiresAt - Date.now()) / 1000))
+      setTtlLeft(left)
+    }, 500)
+    return () => clearInterval(iv)
+  }, [currentBehavior])
 
   const handleSubmit = () => {
     if (!canSubmit) return
@@ -60,8 +83,10 @@ export default function PromptSidebar({ aiTier, currentBehavior, onSubmit, submi
 
   useEffect(() => () => { if (cdRef.current) clearInterval(cdRef.current) }, [])
 
-  const tc = TIER_COLOR[aiTier]
+  const tc    = TIER_COLOR[aiTier]
   const cdPct = ((COOLDOWN_SECS - cooldown) / COOLDOWN_SECS) * 100
+  const ttlPct = currentBehavior.expiresAt === Infinity ? 0
+    : Math.max(0, (ttlLeft / (BEHAVIOR_TTL_MS / 1000)) * 100)
 
   return (
     <div style={{
@@ -99,27 +124,85 @@ export default function PromptSidebar({ aiTier, currentBehavior, onSubmit, submi
         border: '1px solid rgba(6,182,212,0.12)',
         borderRadius: 8, padding: '10px 12px', minHeight: 80,
       }}>
-        <p style={{ fontSize: 7, letterSpacing: '0.45em', color: '#ffffff18', margin: '0 0 6px' }}>EXECUTING</p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <p style={{ fontSize: 7, letterSpacing: '0.45em', color: '#ffffff18', margin: 0 }}>EXECUTING</p>
+          {ttlLeft > 0 && (
+            <span style={{ fontSize: 8, color: ttlLeft < 10 ? '#ef444480' : '#06b6d450', letterSpacing: '0.1em' }}>
+              {ttlLeft}s
+            </span>
+          )}
+        </div>
         <p style={{
           fontSize: 12, color: '#06b6d4cc', lineHeight: 1.55,
           fontFamily: 'Rajdhani', margin: '0 0 8px',
         }}>
           {currentBehavior.description}
         </p>
-        {currentBehavior.mode !== 'idle' && (
+
+        {/* TTL drain bar */}
+        {ttlLeft > 0 && (
+          <div style={{ height: 2, background: 'rgba(255,255,255,0.06)', borderRadius: 1, overflow: 'hidden', marginBottom: 8 }}>
+            <div style={{
+              height: '100%', width: `${ttlPct}%`,
+              background: ttlLeft < 10
+                ? 'linear-gradient(90deg,#ef4444,#f59e0b)'
+                : 'linear-gradient(90deg,#06b6d4,#8b5cf6)',
+              transition: 'width 0.5s linear',
+            }} />
+          </div>
+        )}
+
+        {currentBehavior.mode && currentBehavior.mode !== 'idle' && (
           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             {[
               MODE_TIPS[currentBehavior.mode] ?? currentBehavior.mode.toUpperCase(),
-              currentBehavior.targetMode.toUpperCase(),
-              `AGG ${Math.round(currentBehavior.aggression * 100)}%`,
-            ].map(tag => (
-              <span key={tag} style={{
+              currentBehavior.targetMode ? currentBehavior.targetMode.toUpperCase() : null,
+              typeof currentBehavior.aggression === 'number'
+                ? `AGG ${Math.round(currentBehavior.aggression * 100)}%`
+                : null,
+              typeof currentBehavior.preferredDistance === 'number'
+                ? `DST ${currentBehavior.preferredDistance}u`
+                : null,
+            ].filter(Boolean).map(tag => (
+              <span key={tag as string} style={{
                 fontSize: 7, padding: '2px 6px', borderRadius: 3,
                 color: 'rgba(6,182,212,0.55)', border: '1px solid rgba(6,182,212,0.18)',
               }}>{tag}</span>
             ))}
           </div>
         )}
+      </div>
+
+      {/* ── quick presets ── */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <p style={{ fontSize: 7, letterSpacing: '0.4em', color: '#ffffff18', margin: 0 }}>QUICK ORDERS</p>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {PRESETS.map(({ label, prompt: p }) => (
+            <button
+              key={label}
+              onClick={() => setPrompt(p)}
+              style={{
+                fontSize: 7, padding: '3px 7px', borderRadius: 3,
+                color: 'rgba(139,92,246,0.7)', border: '1px solid rgba(139,92,246,0.25)',
+                background: 'rgba(139,92,246,0.06)', cursor: 'pointer',
+                fontFamily: 'Orbitron', letterSpacing: '0.2em',
+                transition: 'all 0.15s',
+              }}
+              onMouseEnter={e => {
+                e.currentTarget.style.color = 'rgba(139,92,246,1)'
+                e.currentTarget.style.borderColor = 'rgba(139,92,246,0.6)'
+                e.currentTarget.style.background = 'rgba(139,92,246,0.12)'
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.color = 'rgba(139,92,246,0.7)'
+                e.currentTarget.style.borderColor = 'rgba(139,92,246,0.25)'
+                e.currentTarget.style.background = 'rgba(139,92,246,0.06)'
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* ── textarea ── */}
