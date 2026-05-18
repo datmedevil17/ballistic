@@ -2,7 +2,6 @@ package hub
 
 import (
 	"encoding/json"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -13,7 +12,7 @@ const (
 	pongWait   = 60 * time.Second
 	pingPeriod = (pongWait * 9) / 10
 	maxMsgSize = 4096
-	sendBuf    = 256
+	sendBuf    = 512 // larger buffer handles burst from batch broadcasts
 )
 
 // Player represents one connected client.
@@ -22,14 +21,14 @@ type Player struct {
 	Name string
 	Ship string
 
-	X, Z, Rot float64
-	HP, MaxHP int
-	Alive     bool
+	X, Z, Rot      float64
+	HP, MaxHP       int
+	Alive           bool
+	SpawnX, SpawnZ float64
 
 	hub  *Hub
 	conn *websocket.Conn
 	send chan []byte
-	mu   sync.Mutex
 }
 
 func NewPlayer(id, name, ship string, maxHP int, conn *websocket.Conn, h *Hub) *Player {
@@ -46,15 +45,22 @@ func NewPlayer(id, name, ship string, maxHP int, conn *websocket.Conn, h *Hub) *
 	}
 }
 
-// Send enqueues a JSON message for this player (non-blocking; drops if full).
+// Send marshals v and enqueues it (non-blocking; drops if channel full).
+// Use SendBytes when you already have a pre-marshaled message to avoid
+// re-marshaling the same payload for every recipient.
 func (p *Player) Send(v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
+	p.SendBytes(b)
+}
+
+// SendBytes enqueues an already-marshaled message (non-blocking; drops if full).
+func (p *Player) SendBytes(b []byte) {
 	select {
 	case p.send <- b:
-	default:
+	default: // stale position data is safe to drop
 	}
 }
 

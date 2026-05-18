@@ -5,6 +5,7 @@ import Shop from './components/Shop'
 import Profile from './components/Profile'
 import GameModeSelect from './game/GameModeSelect'
 import Game from './game/Game'
+import MultiplayerGame from './game/MultiplayerGame'
 
 export type Screen =
   | 'menu'
@@ -13,6 +14,7 @@ export type Screen =
   | 'profile'
   | 'game_mode_select'
   | 'singleplayer'
+  | 'multiplayer'
 
 export interface GameState {
   selectedShipId: string
@@ -52,6 +54,9 @@ export default function App() {
       {screen === 'game_mode_select' && <GameModeSelect gameState={gameState} setScreen={setScreen} />}
       {screen === 'singleplayer' && (
         <Game key="sp" gameState={gameState} setScreen={setScreen} />
+      )}
+      {screen === 'multiplayer' && (
+        <MultiplayerGame key="mp" gameState={gameState} setScreen={setScreen} />
       )}
     </div>
   )

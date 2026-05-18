@@ -4,7 +4,6 @@ import (
 	"log"
 	"net/http"
 
-	"ballistic-server/internal/game"
 	"ballistic-server/internal/hub"
 
 	"github.com/gin-gonic/gin"
@@ -57,19 +56,7 @@ func main() {
 
 		playerID := uuid.New().String()
 		p := hub.NewPlayer(playerID, name, ship, 150, conn, h)
-
-		// Send the player their own ID immediately
-		p.Send(game.Envelope{
-			Type: game.MsgJoin,
-			Payload: map[string]string{
-				"id":   playerID,
-				"name": name,
-				"ship": ship,
-			},
-		})
-
-		h.RegisterPlayer(p)
-
+		h.RegisterPlayer(p) // hub sends join message with spawn coords
 		go p.WritePump()
 		p.ReadPump()
 	})

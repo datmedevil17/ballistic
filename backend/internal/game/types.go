@@ -4,16 +4,26 @@ package game
 type MsgType string
 
 const (
-	MsgJoin      MsgType = "join"
-	MsgLeave     MsgType = "leave"
-	MsgState     MsgType = "state"
-	MsgShoot     MsgType = "shoot"
-	MsgHit       MsgType = "hit"
-	MsgDead      MsgType = "dead"
-	MsgRanking   MsgType = "ranking"
+	MsgJoin       MsgType = "join"
+	MsgLeave      MsgType = "leave"
+	MsgState      MsgType = "state"
+	MsgBatchState MsgType = "batch_state" // server→client: array of all player positions
+	MsgShoot      MsgType = "shoot"
+	MsgHit        MsgType = "hit"
+	MsgDead       MsgType = "dead"
+	MsgRanking    MsgType = "ranking"
 	MsgPlayerList MsgType = "player_list"
-	MsgError     MsgType = "error"
+	MsgError      MsgType = "error"
 )
+
+// StateSnap is one player's position snapshot inside a batch_state payload.
+type StateSnap struct {
+	ID  string  `json:"id"`
+	X   float64 `json:"x"`
+	Z   float64 `json:"z"`
+	Rot float64 `json:"rot"`
+	HP  int     `json:"hp"`
+}
 
 // Envelope is the top-level wire format for all messages.
 type Envelope struct {
