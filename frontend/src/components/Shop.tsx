@@ -10,6 +10,7 @@ interface Props {
   gameState: GameState
   setScreen: (s: Screen) => void
   buyShip: (id: string, price: number) => void
+  upgradeAiTier: (tier: 2 | 3, cost: number) => void
 }
 
 function ShipCard({ ship, isOwned, isDeployed, canAfford, onBuy, onPreview }: {
@@ -122,8 +123,33 @@ function ShipCard({ ship, isOwned, isDeployed, canAfford, onBuy, onPreview }: {
   )
 }
 
-export default function Shop({ gameState, setScreen, buyShip }: Props) {
+const AI_TIERS = [
+  {
+    tier: 2 as const,
+    cost: 500,
+    name: 'TACTICAL CORE',
+    color: '#8b5cf6',
+    accent: '#a78bfa',
+    badge: 'TIER II',
+    desc: 'Grants your AI pilot awareness of nearby enemy positions and health within 30 units. Enables targeted behavior like hunting wounded ships.',
+    features: ['Nearby enemy positions', 'Enemy HP readout', 'Range-filtered intel (30u)'],
+  },
+  {
+    tier: 3 as const,
+    cost: 1500,
+    name: 'SUPREME INTEL',
+    color: '#f59e0b',
+    accent: '#fbbf24',
+    badge: 'TIER III',
+    desc: 'Full battlefield awareness. All enemies on the map including velocity vectors and heading. Your AI sees everything.',
+    features: ['All enemies on map', 'Velocity + heading data', 'Predictive intercept info'],
+    requires: 2,
+  },
+]
+
+export default function Shop({ gameState, setScreen, buyShip, upgradeAiTier }: Props) {
   const [previewId, setPreviewId] = useState<string | null>(null)
+  const [tab, setTab]             = useState<'ships' | 'ai'>('ships')
   const preview = previewId ? SHIPS.find(s => s.id === previewId) : null
 
   return (
@@ -147,13 +173,24 @@ export default function Shop({ gameState, setScreen, buyShip }: Props) {
           BACK
         </button>
 
-        <div className="text-center">
+        <div className="flex flex-col items-center gap-2">
           <h1 className="text-base tracking-[0.5em]" style={{ fontFamily: 'Orbitron', color: '#f59e0b' }}>
             ARMORY
           </h1>
-          <p className="text-[9px] tracking-[0.3em] mt-0.5" style={{ fontFamily: 'Orbitron', color: '#ffffff30' }}>
-            EXPAND YOUR FLEET
-          </p>
+          <div className="flex gap-1">
+            {(['ships', 'ai'] as const).map(t => (
+              <button key={t} onClick={() => { setTab(t); setPreviewId(null) }}
+                className="text-[8px] px-3 py-1 rounded tracking-widest transition-all duration-200"
+                style={{
+                  fontFamily: 'Orbitron',
+                  color:      tab === t ? '#020408' : '#ffffff40',
+                  background: tab === t ? (t === 'ai' ? 'linear-gradient(135deg,#8b5cf6,#f59e0b)' : '#f59e0b') : 'transparent',
+                  border:     tab === t ? 'none' : '1px solid rgba(255,255,255,0.1)',
+                }}>
+                {t === 'ships' ? 'SHIPS' : 'AI SYSTEMS'}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="flex items-center gap-2 px-4 py-2 rounded" style={{ border: '1px solid #f59e0b30', background: '#f59e0b0a' }}>
@@ -168,6 +205,7 @@ export default function Shop({ gameState, setScreen, buyShip }: Props) {
       {/* Content */}
       <div className="relative z-10 flex flex-1 min-h-0">
         {/* Ship grid */}
+        {tab === 'ships' && (
         <div className="flex-1 overflow-y-auto p-4" style={{ scrollbarWidth: 'thin', scrollbarColor: '#ffffff15 transparent' }}>
           <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))' }}>
             {SHIPS.map(ship => (
@@ -183,6 +221,91 @@ export default function Shop({ gameState, setScreen, buyShip }: Props) {
             ))}
           </div>
         </div>
+        )}
+
+        {/* AI Systems tab */}
+        {tab === 'ai' && (
+        <div className="flex-1 overflow-y-auto p-6" style={{ scrollbarWidth: 'thin', scrollbarColor: '#ffffff15 transparent' }}>
+          <div className="max-w-2xl mx-auto flex flex-col gap-5">
+            <div className="text-center mb-2">
+              <p className="text-[9px] tracking-[0.5em]" style={{ fontFamily: 'Orbitron', color: '#ffffff25' }}>
+                UPGRADE YOUR AI PILOT WITH BETTER BATTLEFIELD INTELLIGENCE
+              </p>
+            </div>
+
+            {/* Current tier badge */}
+            <div className="flex items-center justify-center gap-3 py-3 rounded-lg"
+              style={{ border: '1px solid rgba(255,255,255,0.06)', background: 'rgba(255,255,255,0.02)' }}>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: gameState.aiTier === 3 ? '#f59e0b' : gameState.aiTier === 2 ? '#8b5cf6' : '#06b6d4', boxShadow: `0 0 8px currentColor` }} />
+              <span className="text-[10px] tracking-widest" style={{ fontFamily: 'Orbitron', color: '#ffffff60' }}>
+                CURRENT: {gameState.aiTier === 3 ? 'TIER III · SUPREME INTEL' : gameState.aiTier === 2 ? 'TIER II · TACTICAL CORE' : 'TIER I · BASIC'}
+              </span>
+            </div>
+
+            {AI_TIERS.map(({ tier, cost, name, color, accent, badge, desc, features, requires }) => {
+              const owned    = gameState.aiTier >= tier
+              const locked   = requires !== undefined && gameState.aiTier < requires
+              const canAfford = gameState.coins >= cost && !locked && !owned
+              return (
+                <div key={tier} className="rounded-xl overflow-hidden"
+                  style={{
+                    border: `1px solid ${owned ? color + '60' : color + '25'}`,
+                    background: `linear-gradient(160deg, ${color}08, rgba(0,0,0,0.7))`,
+                    opacity: locked ? 0.45 : 1,
+                  }}>
+                  <div className="h-0.5" style={{ background: `linear-gradient(90deg, transparent, ${color}, transparent)` }} />
+                  <div className="p-5">
+                    <div className="flex items-start justify-between mb-3">
+                      <div>
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[8px] px-2 py-0.5 rounded tracking-widest"
+                            style={{ fontFamily: 'Orbitron', color, border: `1px solid ${color}40`, background: `${color}15` }}>
+                            {badge}
+                          </span>
+                          {owned && <span className="text-[8px] tracking-widest" style={{ fontFamily: 'Orbitron', color: '#22c55e' }}>✓ INSTALLED</span>}
+                          {locked && <span className="text-[8px] tracking-widest" style={{ fontFamily: 'Orbitron', color: '#ffffff30' }}>🔒 REQUIRES TIER II</span>}
+                        </div>
+                        <h3 className="text-lg font-black tracking-wider" style={{ fontFamily: 'Orbitron', color }}>{name}</h3>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-[8px] tracking-wider" style={{ fontFamily: 'Orbitron', color: '#ffffff30' }}>COST</p>
+                        <p className="text-base font-bold" style={{ fontFamily: 'Orbitron', color: '#f59e0b' }}>◆ {cost.toLocaleString()}</p>
+                      </div>
+                    </div>
+
+                    <p className="text-sm mb-4 leading-relaxed" style={{ fontFamily: 'Rajdhani', color: '#8fa3b8', fontSize: 13 }}>{desc}</p>
+
+                    <div className="flex flex-wrap gap-2 mb-4">
+                      {features.map(f => (
+                        <span key={f} className="text-[8px] px-2 py-0.5 rounded tracking-wider"
+                          style={{ fontFamily: 'Orbitron', color: color + 'aa', border: `1px solid ${color}25` }}>
+                          {f}
+                        </span>
+                      ))}
+                    </div>
+
+                    {!owned && (
+                      <button
+                        disabled={!canAfford}
+                        onClick={() => { if (canAfford) upgradeAiTier(tier, cost) }}
+                        className="w-full py-2.5 rounded text-[10px] font-bold tracking-widest transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{
+                          fontFamily: 'Orbitron',
+                          color:      canAfford ? '#020408' : accent,
+                          background: canAfford ? `linear-gradient(135deg, ${color}, ${accent})` : 'transparent',
+                          border:     canAfford ? 'none' : `1px solid ${color}40`,
+                          boxShadow:  canAfford ? `0 0 20px ${color}50` : 'none',
+                        }}>
+                        {locked ? 'LOCKED' : !canAfford && gameState.coins < cost ? 'INSUFFICIENT CREDITS' : `INSTALL — ◆ ${cost.toLocaleString()} CR`}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+        )}
 
         {/* Preview panel */}
         {preview && (

@@ -20,6 +20,7 @@ export interface GameState {
   selectedShipId: string
   ownedShipIds: string[]
   coins: number
+  aiTier: 1 | 2 | 3
 }
 
 export default function App() {
@@ -28,6 +29,7 @@ export default function App() {
     selectedShipId: 'bob',
     ownedShipIds: ['bob'],
     coins: 1000,
+    aiTier: 1,
   })
 
   const buyShip = (shipId: string, price: number) => {
@@ -43,13 +45,17 @@ export default function App() {
     setScreen('menu')
   }
 
+  const upgradeAiTier = (tier: 2 | 3, cost: number) => {
+    setGameState(prev => ({ ...prev, coins: prev.coins - cost, aiTier: tier }))
+  }
+
   const shared = { gameState, setScreen, buyShip, deployShip }
 
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#020408' }}>
       {screen === 'menu' && <MainMenu gameState={gameState} setScreen={setScreen} />}
       {screen === 'selection' && <ShipSelection {...shared} />}
-      {screen === 'shop' && <Shop gameState={gameState} setScreen={setScreen} buyShip={buyShip} />}
+      {screen === 'shop' && <Shop gameState={gameState} setScreen={setScreen} buyShip={buyShip} upgradeAiTier={upgradeAiTier} />}
       {screen === 'profile' && <Profile gameState={gameState} setScreen={setScreen} />}
       {screen === 'game_mode_select' && <GameModeSelect gameState={gameState} setScreen={setScreen} />}
       {screen === 'singleplayer' && (
