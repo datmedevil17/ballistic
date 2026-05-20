@@ -1,8 +1,10 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
 import { SHIPS } from '../data/ships'
 import type { Screen, GameState } from '../App'
 import Starfield from './Starfield'
 import StatBar from './StatBar'
+import { useBallistic } from '../hooks/useBallistic'
+import WalletButton from '../game/WalletButton'
 
 const ShipViewer = lazy(() => import('./ShipViewer'))
 
@@ -16,6 +18,34 @@ export default function Profile({ gameState, setScreen }: Props) {
   const owned = SHIPS.filter(s => gameState.ownedShipIds.includes(s.id))
   const totalPower = Object.values(deployed.stats).reduce((a, b) => a + b, 0)
   const fleetPower = owned.reduce((acc, s) => acc + Object.values(s.stats).reduce((a, b) => a + b, 0), 0)
+
+  const chain = useBallistic()
+  const [rewards, setRewards] = useState<{ unclaimedKills: number; totalKillsEver: number } | null>(null)
+  const [claimStatus, setClaimStatus] = useState<'idle' | 'sending' | 'done' | 'error'>('idle')
+  const [claimSig, setClaimSig] = useState<string | null>(null)
+
+  const fetchRewards = useCallback(async () => {
+    const r = await chain.fetchPendingRewards()
+    setRewards(r)
+  }, [chain])
+
+  useEffect(() => {
+    if (chain.playerKey) fetchRewards()
+  }, [chain.playerKey, fetchRewards])
+
+  const handleClaim = async () => {
+    if (!chain.playerKey || !rewards?.unclaimedKills) return
+    setClaimStatus('sending')
+    setClaimSig(null)
+    const sig = await chain.claimRewards()
+    if (sig) {
+      setClaimSig(sig)
+      setClaimStatus('done')
+      await fetchRewards()
+    } else {
+      setClaimStatus('error')
+    }
+  }
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#020408] flex flex-col">
@@ -87,6 +117,71 @@ export default function Profile({ gameState, setScreen }: Props) {
               <Stat label="FLEET POWER" value={`${fleetPower} PWR`} color="#06b6d4" />
             </div>
           </div>
+        </div>
+
+        {/* Wallet + BALLISTIC Rewards */}
+        <div
+          className="rounded-xl p-5 flex flex-col gap-4"
+          style={{
+            border: '1px solid rgba(6,182,212,0.25)',
+            background: 'linear-gradient(135deg, rgba(6,182,212,0.06), rgba(0,0,0,0.6))',
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <span className="text-[9px] tracking-[0.4em]" style={{ fontFamily: 'Orbitron', color: '#ffffff30' }}>
+              BALLISTIC REWARDS
+            </span>
+            <WalletButton />
+          </div>
+
+          {!chain.playerKey ? (
+            <p className="text-[9px] tracking-wider" style={{ fontFamily: 'Orbitron', color: '#ffffff25' }}>
+              Connect wallet to view rewards
+            </p>
+          ) : (
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex gap-6">
+                <Stat
+                  label="UNCLAIMED KILLS"
+                  value={rewards === null ? '...' : String(rewards.unclaimedKills)}
+                  color="#06b6d4"
+                />
+                <Stat
+                  label="TOTAL KILLS"
+                  value={rewards === null ? '...' : String(rewards.totalKillsEver)}
+                  color="#8b5cf6"
+                />
+              </div>
+
+              <div className="flex flex-col items-end gap-2">
+                <button
+                  onClick={handleClaim}
+                  disabled={claimStatus === 'sending' || !rewards?.unclaimedKills}
+                  className="px-5 py-2 rounded text-[10px] tracking-widest transition-all duration-200"
+                  style={{
+                    fontFamily: 'Orbitron',
+                    cursor: (claimStatus === 'sending' || !rewards?.unclaimedKills) ? 'not-allowed' : 'pointer',
+                    color: rewards?.unclaimedKills ? '#06b6d4' : '#ffffff20',
+                    border: `1px solid ${rewards?.unclaimedKills ? 'rgba(6,182,212,0.5)' : 'rgba(255,255,255,0.08)'}`,
+                    background: rewards?.unclaimedKills ? 'rgba(6,182,212,0.08)' : 'rgba(0,0,0,0.3)',
+                  }}
+                >
+                  {claimStatus === 'sending' ? 'MINTING...' : 'CLAIM TOKENS'}
+                </button>
+
+                {claimStatus === 'done' && claimSig && (
+                  <span className="text-[8px] tracking-wider" style={{ fontFamily: 'Orbitron', color: '#22c55e' }}>
+                    ✓ MINTED
+                  </span>
+                )}
+                {claimStatus === 'error' && (
+                  <span className="text-[8px] tracking-wider" style={{ fontFamily: 'Orbitron', color: '#ef4444' }}>
+                    TX FAILED
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Deployed ship */}

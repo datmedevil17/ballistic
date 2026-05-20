@@ -5,6 +5,7 @@ import * as THREE from 'three'
 import type { Screen, GameState } from '../App'
 import { SHIPS } from '../data/ships'
 import { playLaser, playExplosion, playHit, playEnemyFire, startEngine, updateEngine, stopEngine } from './audio'
+import { useBallistic } from '../hooks/useBallistic'
 
 interface Props {
   gameState: GameState
@@ -477,6 +478,7 @@ interface GameRefs {
   onHudUpdate: (hp: number, score: number, kills: number, wave: number, ec: number, boost: boolean, regenActive: boolean) => void
   onGameOver: (score: number, kills: number) => void
   onWaveComplete: (wave: number, waveKills: number, waveScore: number) => void
+  onSoloKill: () => void
 }
 
 export function spawnExplosion(parts: Particle[], x: number, z: number) {
@@ -645,6 +647,7 @@ function GameLoop(refs: GameRefs) {
               playExplosion()
               refs.kills.current++
               refs.score.current += e.modelIdx === 1 ? 200 : e.modelIdx === 2 ? 150 : 100
+              refs.onSoloKill()
             }
             break
           }
@@ -863,9 +866,10 @@ function GameLoop(refs: GameRefs) {
 }
 
 // ── HUD ────────────────────────────────────────────────────────────────────────
-function HUD({ hp, score, kills, wave, enemyCount, boosting, regenActive, onBack }: {
+function HUD({ hp, score, kills, wave, enemyCount, boosting, regenActive, onBack, chainStatus }: {
   hp: number; score: number; kills: number; wave: number; enemyCount: number
   boosting: boolean; regenActive: boolean; onBack: () => void
+  chainStatus: 'idle' | 'active' | 'ending'
 }) {
   const hpPct = Math.max(0, (hp / PLAYER_HP) * 100)
   const hpColor = hpPct > 50 ? '#22c55e' : hpPct > 25 ? '#f59e0b' : '#ef4444'
@@ -893,6 +897,8 @@ function HUD({ hp, score, kills, wave, enemyCount, boosting, regenActive, onBack
           <span style={{ color: '#06b6d4' }}>KILLS {kills}</span>
           {boosting && <span style={{ color: '#a78bfa', animation: 'hex-pulse 0.4s ease-in-out infinite' }}>⚡ BOOST</span>}
           {regenActive && <span style={{ color: '#22d3ee', animation: 'hex-pulse 1.2s ease-in-out infinite' }}>SHIELD REGEN</span>}
+          {chainStatus === 'active' && <span style={{ color: '#22c55e' }}>⬡ ON-CHAIN</span>}
+          {chainStatus === 'ending' && <span style={{ color: '#f59e0b', animation: 'hex-pulse 1s ease-in-out infinite' }}>⬡ COMMITTING...</span>}
         </div>
 
         <div className="text-right">
@@ -1053,6 +1059,7 @@ function Scene(props: GameRefs) {
 // ── Game ───────────────────────────────────────────────────────────────────────
 export default function Game({ gameState, setScreen }: Props) {
   const ship = SHIPS.find(s => s.id === gameState.selectedShipId) ?? SHIPS[0]
+  const chain = useBallistic()
 
   const [hud, setHud] = useState({ hp: PLAYER_HP, score: 0, kills: 0, wave: 1, enemyCount: 0, boosting: false, regenActive: false })
   const [gameOver, setGameOver] = useState(false)
@@ -1060,11 +1067,14 @@ export default function Game({ gameState, setScreen }: Props) {
   const [finalKills, setFinalKills] = useState(0)
   const [paused, setPaused] = useState(false)
   const [waveComplete, setWaveComplete] = useState<{ wave: number; kills: number; scoreGain: number } | null>(null)
+  // 'idle' = no session yet | 'active' = delegated to ER | 'ending' = commit in progress
+  const [chainStatus, setChainStatus] = useState<'idle' | 'active' | 'ending'>('idle')
 
   const keys   = useRef<Set<string>>(new Set())
   const resetSignal = useRef(0)
   const lastReset   = useRef(-1)
   const pausedRef = useRef(false)
+  const chainDelegated = useRef(false)
 
   const enemies   = useRef<EnemyState[]>(Array.from({ length: MAX_ENEMIES }, () => ({ active: false, x:0,z:0,vx:0,vz:0,hp:0,maxHp:0,modelIdx:0,fireCd:0,engageCd:0,mode:'idle' as const,orbitAngle:0 })))
   const lasers    = useRef<LaserState[]>(Array.from({ length: MAX_LASERS }, () => ({ active:false,x:0,z:0,vx:0,vz:0,life:0,isEnemy:false })))
@@ -1091,17 +1101,60 @@ export default function Game({ gameState, setScreen }: Props) {
   const waveStartKills = useRef(0)
   const waveStartScore = useRef(0)
 
+  // ── chain session lifecycle ─────────────────────────────────────────────────
+  const chainInitKey = useRef<string | null>(null)
+
+  // On mount: create PlayerSession on base layer → delegate to ER (gasless play).
+  // Keyed by the base58 string so reference churn on chain.playerKey never re-fires this.
+  const playerKeyStr = chain.playerKey?.toBase58() ?? null
+  useEffect(() => {
+    if (!playerKeyStr || !chain.progReady || chainInitKey.current === playerKeyStr) return
+    chainInitKey.current = playerKeyStr
+    let cancelled = false
+    const init = async () => {
+      await chain.startAiGame().catch(() => {})
+      if (cancelled) return
+      const s2 = await chain.delegateSession()
+      if (s2 && !cancelled) {
+        chainDelegated.current = true
+        setChainStatus('active')
+      }
+    }
+    init().catch(console.error)
+    return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playerKeyStr, chain.progReady])
+
+  // Commit the session back to base layer, then credit kills into PendingRewards.
+  const commitSession = useCallback(() => {
+    if (!chainDelegated.current) return
+    chainDelegated.current = false
+    setChainStatus('ending')
+    chain.endSession()
+      .then(() => chain.collectSessionRewards())
+      .then(() => setChainStatus('idle'))
+      .catch(console.error)
+  }, [chain])
+
+  // ── game callbacks ──────────────────────────────────────────────────────────
   const onHudUpdate = useCallback((hp: number, sc: number, kl: number, wv: number, ec: number, boosting: boolean, regenActive: boolean) => {
     setHud({ hp, score: sc, kills: kl, wave: wv, enemyCount: ec, boosting, regenActive })
   }, [])
 
   const onGameOver = useCallback((sc: number, kl: number) => {
     setFinalScore(sc); setFinalKills(kl); setGameOver(true)
-  }, [])
+    commitSession()
+  }, [commitSession])
 
   const onWaveComplete = useCallback((wv: number, waveKills: number, waveScore: number) => {
     setWaveComplete({ wave: wv, kills: waveKills, scoreGain: waveScore })
   }, [])
+
+  // Fire-and-forget ER tx for every AI kill — no wallet pop-up.
+  const onSoloKill = useCallback(() => {
+    if (!chainDelegated.current) return
+    chain.recordSoloKill().catch(console.error)
+  }, [chain])
 
   const handleRetry = () => { setGameOver(false); resetSignal.current++ }
 
@@ -1151,7 +1204,7 @@ export default function Game({ gameState, setScreen }: Props) {
     waveCompleteFired, waveCompleteSignal, waveStartKills, waveStartScore,
     modelPath: ship.modelPath,
     shipStats,
-    onHudUpdate, onGameOver, onWaveComplete,
+    onHudUpdate, onGameOver, onWaveComplete, onSoloKill,
   }
 
   const handlePauseResume = () => {
@@ -1160,6 +1213,7 @@ export default function Game({ gameState, setScreen }: Props) {
   }
 
   const handleQuitToMenu = () => {
+    commitSession()
     pausedRef.current = false
     setPaused(false)
     setScreen('menu')
@@ -1190,7 +1244,36 @@ export default function Game({ gameState, setScreen }: Props) {
         />
       ))}
 
-      <HUD {...hud} onBack={() => setScreen('game_mode_select')} />
+      <HUD {...hud} onBack={() => setScreen('game_mode_select')} chainStatus={chainStatus} />
+      {/* Chain init overlay — shown while session is being created and delegated */}
+      {chain.playerKey && chainStatus === 'idle' && !gameOver && (
+        <div style={{
+          position: 'absolute', inset: 0, zIndex: 50,
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(2,4,8,0.82)', backdropFilter: 'blur(4px)',
+          fontFamily: 'Orbitron, sans-serif',
+          gap: 16,
+        }}>
+          <div style={{ fontSize: 10, letterSpacing: '0.5em', color: '#06b6d4', opacity: 0.7 }}>
+            INITIALIZING ON-CHAIN SESSION
+          </div>
+          {!chain.progReady ? (
+            <div style={{ fontSize: 8, letterSpacing: '0.3em', color: '#ffffff40' }}>
+              LOADING PROGRAM...
+            </div>
+          ) : (
+            <div style={{ fontSize: 8, letterSpacing: '0.3em', color: '#ffffff40', animation: 'hex-pulse 1.2s ease-in-out infinite' }}>
+              CREATING SESSION → DELEGATING TO EPHEMERAL ROLLUP...
+            </div>
+          )}
+          <div style={{
+            width: 32, height: 32, border: '2px solid #06b6d420',
+            borderTop: '2px solid #06b6d4', borderRadius: '50%',
+            animation: 'spin 0.9s linear infinite',
+          }} />
+        </div>
+      )}
+
       {paused && !gameOver && waveComplete === null && (
         <PauseMenu onResume={handlePauseResume} onQuit={handleQuitToMenu} />
       )}

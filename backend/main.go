@@ -211,6 +211,21 @@ func fallbackBehavior(prompt string) BehaviorResponse {
 	}
 }
 
+// ── solana address validation ──────────────────────────────────────────────────
+
+func isValidSolanaAddress(addr string) bool {
+	if len(addr) < 32 || len(addr) > 44 {
+		return false
+	}
+	const base58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+	for _, c := range addr {
+		if !strings.ContainsRune(base58, c) {
+			return false
+		}
+	}
+	return true
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func loadEnv(path string) {
@@ -292,7 +307,11 @@ func main() {
 			log.Printf("upgrade error: %v", err)
 			return
 		}
-		playerID := uuid.New().String()
+		wallet := c.Query("wallet")
+		playerID := wallet
+		if !isValidSolanaAddress(wallet) {
+			playerID = uuid.New().String()
+		}
 		p := hub.NewPlayer(playerID, name, ship, 150, conn, h)
 		h.RegisterPlayer(p)
 		go p.WritePump()

@@ -58,6 +58,20 @@ html, body, #root {
   to { width: var(--fill-width); }
 }
 
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes tx-slide-in {
+  from { opacity: 0; transform: translateX(32px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes tx-fade-out {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(32px); }
+}
+
 .scanlines {
   background-image: repeating-linear-gradient(
     0deg,

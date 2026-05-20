@@ -77,6 +77,14 @@ func (h *Hub) Run() {
 
 		// ── player join ───────────────────────────────────────────────────────
 		case p := <-h.register:
+			// evict stale connection with the same wallet ID (reconnect case)
+			if existing, ok := h.players[p.ID]; ok {
+				delete(h.players, existing.ID)
+				delete(h.pendingStates, existing.ID)
+				close(existing.send)
+				h.board.Remove(existing.ID)
+				log.Printf("[hub] evicted stale session for %s", existing.Name)
+			}
 			angle := float64(h.spawnIdx%spawnSlots) * (2 * math.Pi / spawnSlots)
 			p.SpawnX = math.Cos(angle) * spawnRadius
 			p.SpawnZ = math.Sin(angle) * spawnRadius
@@ -97,7 +105,8 @@ func (h *Hub) Run() {
 
 		// ── player leave ──────────────────────────────────────────────────────
 		case p := <-h.unregister:
-			if _, ok := h.players[p.ID]; !ok {
+			// pointer check: skip stale unregisters from evicted sessions
+			if existing, ok := h.players[p.ID]; !ok || existing != p {
 				continue
 			}
 			delete(h.players, p.ID)

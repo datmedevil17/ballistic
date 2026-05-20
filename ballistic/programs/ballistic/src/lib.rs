@@ -1,211 +1,559 @@
 use anchor_lang::prelude::*;
-use ephemeral_rollups_sdk::access_control::instructions::{
-    CommitAndUndelegatePermissionCpiBuilder, CreatePermissionCpiBuilder,
-    DelegatePermissionCpiBuilder, UpdatePermissionCpiBuilder,
-};
-use ephemeral_rollups_sdk::access_control::structs::{Member, MembersArgs, PERMISSION_SEED};
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
 use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
-use ephemeral_rollups_sdk::consts::PERMISSION_PROGRAM_ID;
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::MagicIntentBundleBuilder;
 
-declare_id!("HKzxdYAWje6tALFwBn1ccDau2yCYymp2N6xB6NpRx1gM");
+declare_id!("FeM2fDoHX1wTppwwxSsg1xkXzAwei9WCk3C6tsgozobB");
 
-pub const PLAYER_GAME_SEED: &[u8] = b"player_game";
+pub const SESSION_SEED: &[u8] = b"session";
 pub const GAME_ROOM_SEED: &[u8] = b"game_room";
-pub const MAX_PLAYERS: usize = 16;
+pub const REWARDS_SEED: &[u8] = b"rewards";
+pub const MINT_SEED: &[u8] = b"ballistic_mint";
+pub const MINT_AUTH_SEED: &[u8] = b"mint_authority";
+
+pub const LIVES_PER_PLAYER: u8 = 5;
+pub const MAX_PLAYERS: usize = 10;
 pub const SCORE_PER_KILL: u64 = 100;
+pub const TOKEN_DECIMALS: u8 = 9;
+pub const TOKENS_PER_KILL: u64 = 1_000_000_000; // 1 BALLISTIC per kill (9 decimals)
 
 #[ephemeral]
 #[program]
 pub mod ballistic {
     use super::*;
 
-    /// Create a game room on base layer. Holds the player registry and standings.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Token mint — one-time setup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Initialise the BALLISTIC SPL token mint.
+    /// Mint authority is a program PDA — only claim_rewards can ever mint.
+    pub fn initialize_mint(_ctx: Context<InitializeMint>) -> Result<()> {
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SINGLE PLAYER — base layer setup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Creates the player's session PDA on base layer.
+    /// Call delegate_session immediately after.
+    pub fn start_ai_game(ctx: Context<StartAiGame>) -> Result<()> {
+        let session = &mut ctx.accounts.player_session;
+        // Always reset — init_if_needed keeps the existing account when the
+        // player restarts after a previous session (avoids Custom 101 /
+        // AccountAlreadyInUse from the System Program on re-init).
+        session.player = ctx.accounts.player.key();
+        session.kills = 0;
+        session.score = 0;
+        session.lives = LIVES_PER_PLAYER;
+        session.alive = true;
+        msg!("solo session started for {}", session.player);
+        Ok(())
+    }
+
+    /// Delegates the player session PDA to the Ephemeral Rollup.
+    /// After this all solo gameplay txs are gasless.
+    pub fn delegate_session(ctx: Context<DelegateSession>) -> Result<()> {
+        let session_data = PlayerSession::try_deserialize(
+            &mut ctx.accounts.player_session.data.borrow().as_ref(),
+        )?;
+        require!(session_data.player == ctx.accounts.player.key(), BallisticError::NotCreator);
+
+        ctx.accounts.delegate_player_session(
+            &ctx.accounts.player,
+            &[SESSION_SEED, ctx.accounts.player.key().as_ref()],
+            DelegateConfig::default(),
+        )?;
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SINGLE PLAYER — gasless ER gameplay
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Record an AI kill — gasless ER tx.
+    /// Increments player's kill counter and score in the session PDA.
+    pub fn record_solo_kill(ctx: Context<SoloAction>) -> Result<()> {
+        let session = &mut ctx.accounts.player_session;
+        require!(session.alive, BallisticError::CallerIsDead);
+
+        session.kills += 1;
+        session.score += SCORE_PER_KILL;
+
+        msg!("solo kill: player={} total_kills={}", session.player, session.kills);
+        Ok(())
+    }
+
+    /// Player respawns after dying to AI — gasless ER tx.
+    /// Commits current kill state to base layer as a checkpoint, then marks alive.
+    pub fn solo_respawn(ctx: Context<SoloCommit>) -> Result<()> {
+        {
+            let session = &mut ctx.accounts.player_session;
+            require!(!session.alive, BallisticError::AlreadyAlive);
+            require!(session.lives > 0, BallisticError::NoLivesRemaining);
+            session.alive = true;
+        } // mutable borrow dropped here
+
+        // Checkpoint kills to base layer — PDA stays delegated for continued play.
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.player.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit(&[ctx.accounts.player_session.to_account_info()])
+        .build_and_invoke()?;
+
+        msg!("solo respawn: {} | lives_left={}", ctx.accounts.player_session.player, ctx.accounts.player_session.lives);
+        Ok(())
+    }
+
+    /// Player exits to home screen — commits final kill state and undelegates.
+    /// Call collect_session_rewards on base layer after this.
+    pub fn end_session(ctx: Context<EndSession>) -> Result<()> {
+        let (player_key, kills) = {
+            let s = &ctx.accounts.player_session;
+            (s.player, s.kills)
+        }; // borrow dropped here
+
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.player.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit_and_undelegate(&[ctx.accounts.player_session.to_account_info()])
+        .build_and_invoke()?;
+
+        msg!("solo session ended: {} kills={}", player_key, kills);
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SINGLE PLAYER — base layer settlement
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Credits kills from the ended session into the player's PendingRewards tally.
+    /// Closes the session account (reclaims rent). Call after end_session commits.
+    pub fn collect_session_rewards(ctx: Context<CollectSessionRewards>) -> Result<()> {
+        let kills = ctx.accounts.player_session.kills;
+
+        let rewards = &mut ctx.accounts.pending_rewards;
+        rewards.player = ctx.accounts.player.key();
+        rewards.unclaimed_kills += kills;
+        rewards.total_kills_ever += kills;
+
+        msg!(
+            "session rewards collected: player={} kills={} unclaimed={}",
+            ctx.accounts.player.key(),
+            kills,
+            rewards.unclaimed_kills
+        );
+        // session account is closed via `close = player` constraint — rent returned to player
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MULTIPLAYER — base layer setup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Creator initialises the room on base layer. Status = Lobby.
     pub fn create_room(ctx: Context<CreateRoom>, room_id: u64) -> Result<()> {
         let room = &mut ctx.accounts.game_room;
         room.room_id = room_id;
+        room.creator = ctx.accounts.creator.key();
         room.players = Vec::new();
-        room.active = true;
+        room.status = GameStatus::Lobby;
         room.created_at = Clock::get()?.unix_timestamp;
+        msg!("room {} created by {}", room_id, room.creator);
         Ok(())
     }
 
-    /// Initialize player game state and register in the room (base layer only).
-    /// Call delegate_player next to move to ER.
-    pub fn join_game(ctx: Context<JoinGame>, room_id: u64) -> Result<()> {
+    /// Any player joins the room while it is in Lobby.
+    pub fn join_room(ctx: Context<ModifyRoom>, room_id: u64) -> Result<()> {
         let room = &mut ctx.accounts.game_room;
-        require!(room.active, BallisticError::RoomNotActive);
+        require!(room.status == GameStatus::Lobby, BallisticError::GameAlreadyStarted);
         require!(room.players.len() < MAX_PLAYERS, BallisticError::RoomFull);
+
+        let player_key = ctx.accounts.player.key();
         require!(
-            !room.players.contains(&ctx.accounts.payer.key()),
+            !room.players.iter().any(|p| p.pubkey == player_key),
             BallisticError::AlreadyInRoom
         );
 
-        let state = &mut ctx.accounts.player_game_state;
-        state.player = ctx.accounts.payer.key();
-        state.room_id = room_id;
-        state.kills = 0;
-        state.deaths = 0;
-        state.score = 0;
-
-        room.players.push(ctx.accounts.payer.key());
+        room.players.push(PlayerEntry {
+            pubkey: player_key,
+            kills: 0,
+            score: 0,
+            lives: LIVES_PER_PLAYER,
+            alive: true,
+            rewards_credited: false,
+        });
+        msg!("player {} joined room {} ({}/{})", player_key, room_id, room.players.len(), MAX_PLAYERS);
         Ok(())
     }
 
-    /// Delegate the player's game state to the ER with private access control.
-    /// members = wallets allowed to submit private ER txs for this account (at minimum, the player).
-    pub fn delegate_player(
-        ctx: Context<DelegatePlayerState>,
-        members: Option<Vec<Member>>,
-    ) -> Result<()> {
-        let validator = ctx.accounts.validator.as_ref();
-        let payer_key = ctx.accounts.payer.key();
-        let bump = ctx.bumps.player_game_state;
-        let signer_seeds: &[&[u8]] = &[PLAYER_GAME_SEED, payer_key.as_ref(), &[bump]];
+    /// Player leaves the room while it is still in Lobby.
+    pub fn leave_room(ctx: Context<ModifyRoom>, room_id: u64) -> Result<()> {
+        let room = &mut ctx.accounts.game_room;
+        require!(room.status == GameStatus::Lobby, BallisticError::GameAlreadyStarted);
 
-        // 1. Create or update the permission (access-control) account.
-        if ctx.accounts.permission.data_is_empty() {
-            CreatePermissionCpiBuilder::new(&ctx.accounts.permission_program)
-                .permissioned_account(&ctx.accounts.player_game_state.to_account_info())
-                .permission(&ctx.accounts.permission.to_account_info())
-                .payer(&ctx.accounts.payer.to_account_info())
-                .system_program(&ctx.accounts.system_program.to_account_info())
-                .args(MembersArgs { members })
-                .invoke_signed(&[signer_seeds])?;
+        let player_key = ctx.accounts.player.key();
+        let before = room.players.len();
+        room.players.retain(|p| p.pubkey != player_key);
+        require!(room.players.len() < before, BallisticError::PlayerNotFound);
+        msg!("player {} left room {}", player_key, room_id);
+        Ok(())
+    }
+
+    /// Creator locks the room and marks it Active. Requires at least 2 players.
+    /// Call start_game then delegate_room back-to-back.
+    pub fn start_game(ctx: Context<CreatorRoom>, _room_id: u64) -> Result<()> {
+        let room = &mut ctx.accounts.game_room;
+        require!(room.status == GameStatus::Lobby, BallisticError::GameAlreadyStarted);
+        require!(room.players.len() >= 2, BallisticError::NotEnoughPlayers);
+        room.status = GameStatus::Active;
+        msg!("room started with {} players", room.players.len());
+        Ok(())
+    }
+
+    /// Creator delegates the GameRoom PDA to the ER.
+    /// Must be called after start_game. All subsequent gameplay is gasless.
+    pub fn delegate_room(ctx: Context<DelegateRoom>, room_id: u64) -> Result<()> {
+        let room_data = GameRoom::try_deserialize(
+            &mut ctx.accounts.game_room.data.borrow().as_ref(),
+        )?;
+        require!(room_data.creator == ctx.accounts.creator.key(), BallisticError::NotCreator);
+        require!(room_data.status == GameStatus::Active, BallisticError::GameNotStarted);
+
+        ctx.accounts.delegate_game_room(
+            &ctx.accounts.creator,
+            &[GAME_ROOM_SEED, &room_id.to_le_bytes()],
+            DelegateConfig::default(),
+        )?;
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MULTIPLAYER — gasless ER gameplay
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Record a kill — gasless ER tx.
+    /// Killer's counter increments. Victim loses one life and is marked dead.
+    pub fn record_kill(ctx: Context<UpdateRoom>, _room_id: u64, victim: Pubkey) -> Result<()> {
+        let room = &mut ctx.accounts.game_room;
+        require!(room.status == GameStatus::Active, BallisticError::GameNotActive);
+
+        let killer_key = ctx.accounts.player.key();
+        require!(killer_key != victim, BallisticError::CannotKillSelf);
+
+        let killer_idx = room
+            .players
+            .iter()
+            .position(|p| p.pubkey == killer_key)
+            .ok_or(BallisticError::PlayerNotFound)?;
+        let victim_idx = room
+            .players
+            .iter()
+            .position(|p| p.pubkey == victim)
+            .ok_or(BallisticError::PlayerNotFound)?;
+
+        require!(room.players[killer_idx].alive, BallisticError::CallerIsDead);
+        require!(room.players[victim_idx].alive, BallisticError::VictimAlreadyDead);
+
+        room.players[killer_idx].kills += 1;
+        room.players[killer_idx].score += SCORE_PER_KILL;
+        room.players[victim_idx].lives = room.players[victim_idx].lives.saturating_sub(1);
+        room.players[victim_idx].alive = false;
+
+        msg!(
+            "kill: {} → {} | victim lives_left={}",
+            killer_key,
+            victim,
+            room.players[victim_idx].lives
+        );
+        Ok(())
+    }
+
+    /// Player respawns after cooldown — gasless ER tx.
+    /// Only allowed if the player still has lives remaining.
+    pub fn respawn(ctx: Context<UpdateRoom>, _room_id: u64) -> Result<()> {
+        let room = &mut ctx.accounts.game_room;
+        require!(room.status == GameStatus::Active, BallisticError::GameNotActive);
+
+        let player_key = ctx.accounts.player.key();
+
+        let player = room
+            .players
+            .iter_mut()
+            .find(|p| p.pubkey == player_key)
+            .ok_or(BallisticError::PlayerNotFound)?;
+
+        require!(!player.alive, BallisticError::AlreadyAlive);
+        require!(player.lives > 0, BallisticError::NoLivesRemaining);
+
+        player.alive = true;
+        msg!("respawn: {} | lives_left={}", player_key, player.lives);
+        Ok(())
+    }
+
+    /// Last surviving player calls this to end the game — gasless ER tx.
+    /// Commits the final room state to base layer and undelegates.
+    /// If all players exhaust lives simultaneously, any room member can close.
+    pub fn end_game(ctx: Context<EndGame>, _room_id: u64) -> Result<()> {
+        let room = &mut ctx.accounts.game_room;
+        require!(room.status == GameStatus::Active, BallisticError::GameNotActive);
+
+        let caller = ctx.accounts.player.key();
+        let active_count = room.players.iter().filter(|p| p.lives > 0).count();
+        require!(active_count <= 1, BallisticError::GameStillActive);
+
+        if active_count == 1 {
+            let winner = room.players.iter().find(|p| p.lives > 0).unwrap();
+            require!(winner.pubkey == caller, BallisticError::NotTheWinner);
+            msg!("game over — winner: {}", caller);
         } else {
-            UpdatePermissionCpiBuilder::new(&ctx.accounts.permission_program.to_account_info())
-                .authority(&ctx.accounts.payer.to_account_info(), true)
-                .permissioned_account(&ctx.accounts.player_game_state.to_account_info(), true)
-                .permission(&ctx.accounts.permission.to_account_info())
-                .args(MembersArgs { members })
-                .invoke_signed(&[signer_seeds])?;
+            require!(
+                room.players.iter().any(|p| p.pubkey == caller),
+                BallisticError::PlayerNotFound
+            );
+            msg!("game over — no survivors");
         }
 
-        // 2. Delegate the permission account to the ER.
-        if ctx.accounts.permission.owner != &ephemeral_rollups_sdk::id() {
-            DelegatePermissionCpiBuilder::new(&ctx.accounts.permission_program.to_account_info())
-                .permissioned_account(&ctx.accounts.player_game_state.to_account_info(), true)
-                .permission(&ctx.accounts.permission.to_account_info())
-                .payer(&ctx.accounts.payer.to_account_info())
-                .authority(&ctx.accounts.player_game_state.to_account_info(), false)
-                .system_program(&ctx.accounts.system_program.to_account_info())
-                .owner_program(&ctx.accounts.permission_program.to_account_info())
-                .delegation_buffer(&ctx.accounts.buffer_permission.to_account_info())
-                .delegation_metadata(
-                    &ctx.accounts.delegation_metadata_permission.to_account_info(),
-                )
-                .delegation_record(&ctx.accounts.delegation_record_permission.to_account_info())
-                .delegation_program(&ctx.accounts.delegation_program.to_account_info())
-                .validator(validator)
-                .invoke_signed(&[signer_seeds])?;
-        }
+        room.status = GameStatus::Ended;
+        room.exit(&crate::ID)?;
 
-        // 3. Delegate the player game state account to the ER.
-        if ctx.accounts.player_game_state.owner != &ephemeral_rollups_sdk::id() {
-            ctx.accounts.delegate_player_game_state(
-                &ctx.accounts.payer,
-                &[PLAYER_GAME_SEED, payer_key.as_ref()],
-                DelegateConfig {
-                    validator: validator.map(|v| v.key()),
-                    ..Default::default()
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.player.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit_and_undelegate(&[ctx.accounts.game_room.to_account_info()])
+        .build_and_invoke()?;
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MULTIPLAYER — base layer settlement
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Credits a player's kills from an ended room into their PendingRewards tally.
+    /// Must be called on base layer after end_game has committed the room.
+    /// Each player calls this once — double-credit is blocked by rewards_credited flag.
+    pub fn update_rewards(ctx: Context<UpdateRewards>, room_id: u64) -> Result<()> {
+        let room = &mut ctx.accounts.game_room;
+        require!(room.status == GameStatus::Ended, BallisticError::GameNotEnded);
+
+        let player_key = ctx.accounts.player.key();
+        let player = room
+            .players
+            .iter_mut()
+            .find(|p| p.pubkey == player_key)
+            .ok_or(BallisticError::PlayerNotFound)?;
+
+        require!(!player.rewards_credited, BallisticError::RewardsAlreadyCredited);
+
+        let kills = player.kills;
+        player.rewards_credited = true;
+
+        let rewards = &mut ctx.accounts.pending_rewards;
+        rewards.player = player_key;
+        rewards.unclaimed_kills += kills;
+        rewards.total_kills_ever += kills;
+
+        msg!(
+            "rewards updated: player={} room={} kills_credited={} unclaimed={}",
+            player_key,
+            room_id,
+            kills,
+            rewards.unclaimed_kills
+        );
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SHARED — profile token claim
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Mint BALLISTIC tokens for all unclaimed kills and reset the tally.
+    /// Rate: 1 kill = 1 BALLISTIC (9 decimals). Works for kills from any game mode.
+    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        let rewards = &mut ctx.accounts.pending_rewards;
+        let unclaimed = rewards.unclaimed_kills;
+        require!(unclaimed > 0, BallisticError::NothingToClaim);
+
+        let amount = unclaimed
+            .checked_mul(TOKENS_PER_KILL)
+            .ok_or(BallisticError::Overflow)?;
+
+        rewards.unclaimed_kills = 0;
+
+        let bump = ctx.bumps.mint_authority;
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.key(),
+                MintTo {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.player_token_account.to_account_info(),
+                    authority: ctx.accounts.mint_authority.to_account_info(),
                 },
-            )?;
-        }
+                &[&[MINT_AUTH_SEED, &[bump]]],
+            ),
+            amount,
+        )?;
 
-        Ok(())
-    }
-
-    /// Record a kill — gasless ER tx. Private: only members of the permission list can call.
-    pub fn record_kill(ctx: Context<UpdateState>) -> Result<()> {
-        let state = &mut ctx.accounts.player_game_state;
-        state.kills += 1;
-        state.score += SCORE_PER_KILL;
         msg!(
-            "kill player={} kills={} score={}",
-            state.player,
-            state.kills,
-            state.score
+            "claimed: player={} kills={} tokens={}",
+            ctx.accounts.player.key(),
+            unclaimed,
+            amount
         );
-        Ok(())
-    }
-
-    /// Send an AI behavior prompt — private ER tx. Not stored on-chain, emitted as a log.
-    /// The ER access control ensures only the player (or allowed members) can submit.
-    pub fn send_prompt(ctx: Context<UpdateState>, data: String) -> Result<()> {
-        msg!(
-            "prompt player={} data={}",
-            ctx.accounts.player_game_state.player,
-            data
-        );
-        Ok(())
-    }
-
-    /// Commit state snapshot to base layer after death. Account stays delegated — player respawns.
-    pub fn checkpoint(ctx: Context<CommitState>) -> Result<()> {
-        let state = &mut ctx.accounts.player_game_state;
-        state.deaths += 1;
-        msg!(
-            "checkpoint player={} kills={} deaths={} score={}",
-            state.player,
-            state.kills,
-            state.deaths,
-            state.score
-        );
-        // Serialize Anchor account before the commit CPI.
-        state.exit(&crate::ID)?;
-        MagicIntentBundleBuilder::new(
-            ctx.accounts.payer.to_account_info(),
-            ctx.accounts.magic_context.to_account_info(),
-            ctx.accounts.magic_program.to_account_info(),
-        )
-        .commit(&[ctx.accounts.player_game_state.to_account_info()])
-        .build_and_invoke()?;
-        Ok(())
-    }
-
-    /// Commit final state and undelegate — player leaves game permanently.
-    /// Final kills/score are written to base layer; GameRoom standings can be read from there.
-    pub fn leave_game(ctx: Context<LeaveGame>) -> Result<()> {
-        let state = &mut ctx.accounts.player_game_state;
-        msg!(
-            "leave player={} kills={} deaths={} score={}",
-            state.player,
-            state.kills,
-            state.deaths,
-            state.score
-        );
-        let payer_key = ctx.accounts.payer.key();
-        let bump = ctx.bumps.player_game_state;
-        // Serialize Anchor account before commit+undelegate CPIs.
-        state.exit(&crate::ID)?;
-
-        // 1. Commit and undelegate the permission account atomically.
-        CommitAndUndelegatePermissionCpiBuilder::new(
-            &ctx.accounts.permission_program.to_account_info(),
-        )
-        .authority(&ctx.accounts.payer.to_account_info(), true)
-        .permissioned_account(&ctx.accounts.player_game_state.to_account_info(), true)
-        .permission(&ctx.accounts.permission.to_account_info())
-        .magic_context(&ctx.accounts.magic_context.to_account_info())
-        .magic_program(&ctx.accounts.magic_program.to_account_info())
-        .invoke_signed(&[&[PLAYER_GAME_SEED, payer_key.as_ref(), &[bump]]])?;
-
-        // 2. Commit and undelegate the player game state account.
-        MagicIntentBundleBuilder::new(
-            ctx.accounts.payer.to_account_info(),
-            ctx.accounts.magic_context.to_account_info(),
-            ctx.accounts.magic_program.to_account_info(),
-        )
-        .commit_and_undelegate(&[ctx.accounts.player_game_state.to_account_info()])
-        .build_and_invoke()?;
-
         Ok(())
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Account contexts
+// Account contexts — token
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Accounts)]
+pub struct InitializeMint<'info> {
+    /// The BALLISTIC token mint — fixed program PDA, created once.
+    #[account(
+        init,
+        payer = payer,
+        mint::decimals = TOKEN_DECIMALS,
+        mint::authority = mint_authority,
+        seeds = [MINT_SEED],
+        bump,
+    )]
+    pub mint: Account<'info, Mint>,
+    /// CHECK: Program PDA that holds mint authority — only claim_rewards signs with it.
+    #[account(seeds = [MINT_AUTH_SEED], bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimRewards<'info> {
+    #[account(mut, seeds = [MINT_SEED], bump)]
+    pub mint: Account<'info, Mint>,
+    /// CHECK: Mint authority PDA — signs the mint_to CPI.
+    #[account(seeds = [MINT_AUTH_SEED], bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        seeds = [REWARDS_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub pending_rewards: Account<'info, PendingRewards>,
+    /// Player's BALLISTIC token account — created here if it does not exist.
+    #[account(
+        init_if_needed,
+        payer = player,
+        associated_token::mint = mint,
+        associated_token::authority = player,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub player: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account contexts — single player
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Accounts)]
+pub struct StartAiGame<'info> {
+    // `init_if_needed` — creates the account on first play; reuses it on
+    // subsequent plays (fields are reset in the instruction body).
+    // Without this, replaying causes Custom 101 (AccountAlreadyInUse).
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = PlayerSession::SIZE,
+        seeds = [SESSION_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub player_session: Account<'info, PlayerSession>,
+    #[account(mut)]
+    pub player: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/// #[delegate] macro generates delegate_player_session() on this struct.
+#[delegate]
+#[derive(Accounts)]
+pub struct DelegateSession<'info> {
+    pub player: Signer<'info>,
+    /// CHECK: Ownership verified in instruction body before delegation.
+    #[account(mut, del, seeds = [SESSION_SEED, player.key().as_ref()], bump)]
+    pub player_session: UncheckedAccount<'info>,
+}
+
+/// record_solo_kill — gasless ER tx.
+#[derive(Accounts)]
+pub struct SoloAction<'info> {
+    #[account(mut, seeds = [SESSION_SEED, player.key().as_ref()], bump)]
+    pub player_session: Account<'info, PlayerSession>,
+    pub player: Signer<'info>,
+}
+
+/// solo_respawn — gasless ER tx with commit checkpoint.
+/// #[commit] injects magic_context and magic_program.
+#[commit]
+#[derive(Accounts)]
+pub struct SoloCommit<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+    #[account(mut, seeds = [SESSION_SEED, player.key().as_ref()], bump)]
+    pub player_session: Account<'info, PlayerSession>,
+}
+
+/// end_session — gasless ER tx, commit + undelegate.
+/// #[commit] injects magic_context and magic_program.
+#[commit]
+#[derive(Accounts)]
+pub struct EndSession<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+    #[account(mut, seeds = [SESSION_SEED, player.key().as_ref()], bump)]
+    pub player_session: Account<'info, PlayerSession>,
+}
+
+#[derive(Accounts)]
+pub struct CollectSessionRewards<'info> {
+    /// Session is closed after this call — rent returned to player.
+    #[account(
+        mut,
+        close = player,
+        seeds = [SESSION_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub player_session: Account<'info, PlayerSession>,
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = PendingRewards::SIZE,
+        seeds = [REWARDS_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub pending_rewards: Account<'info, PendingRewards>,
+    #[account(mut)]
+    pub player: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account contexts — multiplayer
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Accounts)]
@@ -213,134 +561,158 @@ pub mod ballistic {
 pub struct CreateRoom<'info> {
     #[account(
         init,
-        payer = payer,
+        payer = creator,
         space = GameRoom::SIZE,
         seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()],
         bump,
     )]
     pub game_room: Account<'info, GameRoom>,
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub creator: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 #[instruction(room_id: u64)]
-pub struct JoinGame<'info> {
-    #[account(
-        init,
-        payer = payer,
-        space = PlayerGameState::SIZE,
-        seeds = [PLAYER_GAME_SEED, payer.key().as_ref()],
-        bump,
-    )]
-    pub player_game_state: Account<'info, PlayerGameState>,
+pub struct ModifyRoom<'info> {
+    #[account(mut, seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()], bump)]
+    pub game_room: Account<'info, GameRoom>,
+    pub player: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(room_id: u64)]
+pub struct CreatorRoom<'info> {
     #[account(
         mut,
         seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()],
         bump,
+        has_one = creator @ BallisticError::NotCreator,
     )]
     pub game_room: Account<'info, GameRoom>,
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    pub system_program: Program<'info, System>,
+    pub creator: Signer<'info>,
 }
 
-/// Add delegate function to the context via macro.
+/// #[delegate] macro generates delegate_game_room() on this struct.
 #[delegate]
 #[derive(Accounts)]
-pub struct DelegatePlayerState<'info> {
-    pub payer: Signer<'info>,
-    /// CHECK: The player game state PDA to delegate.
-    #[account(mut, del, seeds = [PLAYER_GAME_SEED, payer.key().as_ref()], bump)]
-    pub player_game_state: UncheckedAccount<'info>,
-    /// CHECK: Permission account for the player PDA.
-    #[account(mut, seeds = [PERMISSION_SEED, player_game_state.key().as_ref()], bump, seeds::program = permission_program.key())]
-    pub permission: UncheckedAccount<'info>,
-    /// CHECK: Buffer for permission delegation.
-    #[account(mut, seeds = [ephemeral_rollups_sdk::pda::DELEGATE_BUFFER_TAG, permission.key().as_ref()], bump, seeds::program = PERMISSION_PROGRAM_ID)]
-    pub buffer_permission: UncheckedAccount<'info>,
-    /// CHECK: Delegation record for permission.
-    #[account(mut, seeds = [ephemeral_rollups_sdk::pda::DELEGATION_RECORD_TAG, permission.key().as_ref()], bump, seeds::program = ephemeral_rollups_sdk::id())]
-    pub delegation_record_permission: UncheckedAccount<'info>,
-    /// CHECK: Delegation metadata for permission.
-    #[account(mut, seeds = [ephemeral_rollups_sdk::pda::DELEGATION_METADATA_TAG, permission.key().as_ref()], bump, seeds::program = ephemeral_rollups_sdk::id())]
-    pub delegation_metadata_permission: UncheckedAccount<'info>,
-    /// CHECK: Permission Program.
-    #[account(address = PERMISSION_PROGRAM_ID)]
-    pub permission_program: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
-    /// CHECK: Validated by the delegate program.
-    pub validator: Option<AccountInfo<'info>>,
+#[instruction(room_id: u64)]
+pub struct DelegateRoom<'info> {
+    pub creator: Signer<'info>,
+    /// CHECK: Creator and status verified in instruction body before delegation.
+    #[account(mut, del, seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()], bump)]
+    pub game_room: UncheckedAccount<'info>,
 }
 
-/// Used for record_kill and send_prompt — gasless private ER txs.
-/// Signer is the player; seeds tie the account to their pubkey.
+/// record_kill and respawn — gasless ER txs.
 #[derive(Accounts)]
-pub struct UpdateState<'info> {
-    #[account(mut, seeds = [PLAYER_GAME_SEED, player.key().as_ref()], bump)]
-    pub player_game_state: Account<'info, PlayerGameState>,
+#[instruction(room_id: u64)]
+pub struct UpdateRoom<'info> {
+    #[account(mut, seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()], bump)]
+    pub game_room: Account<'info, GameRoom>,
     pub player: Signer<'info>,
 }
 
-/// #[commit] injects magic_context and magic_program accounts.
+/// end_game — #[commit] injects magic_context and magic_program.
 #[commit]
 #[derive(Accounts)]
-pub struct CommitState<'info> {
+#[instruction(room_id: u64)]
+pub struct EndGame<'info> {
     #[account(mut)]
-    pub payer: Signer<'info>,
-    #[account(mut, seeds = [PLAYER_GAME_SEED, payer.key().as_ref()], bump)]
-    pub player_game_state: Account<'info, PlayerGameState>,
+    pub player: Signer<'info>,
+    #[account(mut, seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()], bump)]
+    pub game_room: Account<'info, GameRoom>,
 }
 
-/// Same as CommitState but also carries the permission + permission program
-/// so both can be atomically undelegated in a single ER transaction.
-#[commit]
 #[derive(Accounts)]
-pub struct LeaveGame<'info> {
+#[instruction(room_id: u64)]
+pub struct UpdateRewards<'info> {
+    /// The committed (Ended) game room — read to pull player kill count.
+    #[account(mut, seeds = [GAME_ROOM_SEED, &room_id.to_le_bytes()], bump)]
+    pub game_room: Account<'info, GameRoom>,
+    /// Created on first update_rewards call by this player.
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = PendingRewards::SIZE,
+        seeds = [REWARDS_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub pending_rewards: Account<'info, PendingRewards>,
     #[account(mut)]
-    pub payer: Signer<'info>,
-    #[account(mut, seeds = [PLAYER_GAME_SEED, payer.key().as_ref()], bump)]
-    pub player_game_state: Account<'info, PlayerGameState>,
-    /// CHECK: Checked by the permission program.
-    #[account(mut, seeds = [PERMISSION_SEED, player_game_state.key().as_ref()], bump, seeds::program = permission_program.key())]
-    pub permission: UncheckedAccount<'info>,
-    /// CHECK: Permission Program.
-    #[account(address = PERMISSION_PROGRAM_ID)]
-    pub permission_program: UncheckedAccount<'info>,
+    pub player: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Lives on the ER while the player is in game. Committed to base layer on
-/// checkpoint (death + respawn) or leave_game (permanent exit).
+/// Per-session solo game state. Lives on ER while game is active, committed on exit.
 #[account]
-pub struct PlayerGameState {
-    pub player: Pubkey, // 32
-    pub room_id: u64,   // 8
-    pub kills: u64,     // 8
-    pub deaths: u64,    // 8
-    pub score: u64,     // 8
+pub struct PlayerSession {
+    pub player: Pubkey,  // 32
+    pub kills: u64,      // 8
+    pub score: u64,      // 8
+    pub lives: u8,       // 1
+    pub alive: bool,     // 1
 }
 
-impl PlayerGameState {
-    pub const SIZE: usize = 8 + 32 + 8 + 8 + 8 + 8; // discriminator + fields
+impl PlayerSession {
+    pub const SIZE: usize = 8 + 32 + 8 + 8 + 1 + 1; // 58
 }
 
-/// Always on base layer. Tracks the player registry for a room.
-/// Standings are derived by reading each player's committed PlayerGameState.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq)]
+pub enum GameStatus {
+    Lobby,
+    Active,
+    Ended,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PlayerEntry {
+    pub pubkey: Pubkey,          // 32
+    pub kills: u64,              // 8
+    pub score: u64,              // 8
+    pub lives: u8,               // 1
+    pub alive: bool,             // 1
+    pub rewards_credited: bool,  // 1
+}
+
+impl PlayerEntry {
+    pub const SIZE: usize = 32 + 8 + 8 + 1 + 1 + 1; // 51
+}
+
 #[account]
 pub struct GameRoom {
-    pub room_id: u64,         // 8
-    pub players: Vec<Pubkey>, // 4 + MAX_PLAYERS * 32
-    pub active: bool,         // 1
-    pub created_at: i64,      // 8
+    pub room_id: u64,              // 8
+    pub creator: Pubkey,           // 32
+    pub players: Vec<PlayerEntry>, // 4 + MAX_PLAYERS * 59
+    pub status: GameStatus,        // 1
+    pub created_at: i64,           // 8
 }
 
 impl GameRoom {
-    pub const SIZE: usize = 8 + 8 + (4 + MAX_PLAYERS * 32) + 1 + 8;
+    pub const SIZE: usize = 8                              // discriminator
+        + 8                                                // room_id
+        + 32                                               // creator
+        + 4 + MAX_PLAYERS * PlayerEntry::SIZE              // players vec
+        + 1                                                // status
+        + 8;                                               // created_at
+}
+
+/// Persistent profile kill accumulator — lives on base layer across all games.
+/// Both solo (collect_session_rewards) and multiplayer (update_rewards) feed into this.
+/// Call claim_rewards to mint tokens.
+#[account]
+pub struct PendingRewards {
+    pub player: Pubkey,        // 32
+    pub unclaimed_kills: u64,  // 8
+    pub total_kills_ever: u64, // 8
+}
+
+impl PendingRewards {
+    pub const SIZE: usize = 8 + 32 + 8 + 8; // 56
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -349,10 +721,42 @@ impl GameRoom {
 
 #[error_code]
 pub enum BallisticError {
-    #[msg("Game room is full (max 16 players)")]
+    #[msg("Room is full (max 10 players)")]
     RoomFull,
     #[msg("Player is already in this room")]
     AlreadyInRoom,
-    #[msg("Game room is not active")]
-    RoomNotActive,
+    #[msg("Game has already started")]
+    GameAlreadyStarted,
+    #[msg("Game has not been started yet — call start_game first")]
+    GameNotStarted,
+    #[msg("Game is not active")]
+    GameNotActive,
+    #[msg("Game has not ended yet")]
+    GameNotEnded,
+    #[msg("Need at least 2 players to start")]
+    NotEnoughPlayers,
+    #[msg("Only the room creator can do this")]
+    NotCreator,
+    #[msg("Player not found in this room")]
+    PlayerNotFound,
+    #[msg("Cannot kill yourself")]
+    CannotKillSelf,
+    #[msg("Dead players cannot record kills")]
+    CallerIsDead,
+    #[msg("Victim is already dead")]
+    VictimAlreadyDead,
+    #[msg("Player is already alive")]
+    AlreadyAlive,
+    #[msg("No lives remaining — permanently out")]
+    NoLivesRemaining,
+    #[msg("Game still has active players")]
+    GameStillActive,
+    #[msg("Only the last surviving player can end the game")]
+    NotTheWinner,
+    #[msg("Rewards already credited for this game")]
+    RewardsAlreadyCredited,
+    #[msg("No kills to claim")]
+    NothingToClaim,
+    #[msg("Token amount overflow")]
+    Overflow,
 }

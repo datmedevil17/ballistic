@@ -2,6 +2,8 @@ import { useRef, useState, useEffect, useMemo, useCallback } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { useGLTF } from '@react-three/drei'
 import * as THREE from 'three'
+import { useWallet } from '@solana/wallet-adapter-react'
+import { PublicKey } from '@solana/web3.js'
 import type { Screen, GameState } from '../App'
 import { SHIPS } from '../data/ships'
 import {
@@ -17,8 +19,12 @@ import {
 } from './BehaviorEngine'
 import type { Behavior, EnemyInfo, BehaviorState } from './BehaviorEngine'
 import PromptSidebar from './PromptSidebar'
+import WalletButton from './WalletButton'
+import { useBallistic } from '../hooks/useBallistic'
 
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
+// Single global on-chain room shared by all concurrent players.
+const ROOM_ID = 1
 const FIRE_CD = 16
 const SEND_EVERY = 3
 
@@ -251,6 +257,8 @@ interface Props { gameState: GameState; setScreen: (s: Screen) => void }
 export default function MultiplayerGame({ gameState, setScreen }: Props) {
   const ship    = SHIPS.find(s => s.id === gameState.selectedShipId) ?? SHIPS[0]
   const aiTier  = gameState.aiTier
+  const { publicKey } = useWallet()
+  const chain = useBallistic()
 
   const [phase,          setPhase]          = useState<Phase>('name_input')
   const [nameInput,      setNameInput]       = useState('Commander')
@@ -263,6 +271,11 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
   const [submitting,     setSubmitting]      = useState(false)
   const [promptError,    setPromptError]     = useState<string | null>(null)
   const killId = useRef(0)
+
+  // chain state refs
+  const roomDelegated  = useRef(false)   // true once delegateRoom confirms
+  const isRoomCreator  = useRef(false)   // true if this player called createRoom
+  const gameStarted    = useRef(false)   // prevents double start_game calls
 
   // game state refs
   const wsRef       = useRef<WebSocket | null>(null)
@@ -344,6 +357,29 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
     }
   }, [phase, handlePrompt])
 
+  // ── room lifecycle ────────────────────────────────────────────────────────────
+  const joinOnChainRoom = useCallback(async () => {
+    const created = await chain.createRoom(ROOM_ID)
+    isRoomCreator.current = !!created
+    if (!created) await chain.joinRoom(ROOM_ID)
+  }, [chain])
+
+  const tryStartOnChainGame = useCallback(async (playerCount: number) => {
+    if (!isRoomCreator.current || gameStarted.current || playerCount < 2) return
+    gameStarted.current = true
+    const s1 = await chain.startGame(ROOM_ID)
+    if (!s1) { gameStarted.current = false; return }
+    const s2 = await chain.delegateRoom(ROOM_ID)
+    if (s2) roomDelegated.current = true
+  }, [chain])
+
+  const finaliseOnChain = useCallback(() => {
+    if (!roomDelegated.current) return
+    chain.endGame(ROOM_ID)
+      .then(() => chain.updateRewards(ROOM_ID))
+      .catch(console.error)
+  }, [chain])
+
   // ── WS message handler ───────────────────────────────────────────────────────
   const handleMsg = useCallback((env: { type: string; payload: any }) => {
     switch (env.type) {
@@ -366,6 +402,9 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
         }
         for (const id of remotePos.current.keys()) { if (!next.has(id)) remotePos.current.delete(id) }
         setRemotePlayers(next)
+        // Creator kicks off start_game + delegate_room once ≥2 players are present.
+        const totalPlayers = (env.payload as any[]).length
+        tryStartOnChainGame(totalPlayers).catch(console.error)
         break
       }
       case 'state': {
@@ -393,13 +432,23 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
         break
       }
       case 'dead': {
-        const { player_id, player_name, killer_name } = env.payload
+        const { player_id, player_name, killer_id, killer_name } = env.payload
         if (player_id === myIdRef.current) {
+          // We were killed — commit the on-chain room state.
           deadRef.current = true
           setPhase('dead')
+          finaliseOnChain()
         } else {
           const pos = remotePos.current.get(player_id)
           if (pos) pos.alive = false
+          // If we are the killer, record it on the ER (gasless).
+          if (killer_id === myIdRef.current && roomDelegated.current) {
+            try {
+              chain.recordKill(ROOM_ID, new PublicKey(player_id)).catch(console.error)
+            } catch {
+              // player_id may not be a valid pubkey if the player joined without a wallet
+            }
+          }
         }
         setKillFeed(prev => [...prev.slice(-3), { id: killId.current++, killer: killer_name, victim: player_name }])
         break
@@ -409,19 +458,26 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
         break
       }
     }
-  }, [])
+  }, [chain, tryStartOnChainGame, finaliseOnChain])
 
   // ── connect ──────────────────────────────────────────────────────────────────
-  const connect = useCallback((name: string) => {
+  const launchGame = useCallback((name: string) => {
     initialPromptRef.current = initialPrompt.trim()
     setPhase('connecting')
-    const url = `${WS_URL}?name=${encodeURIComponent(name)}&ship=${encodeURIComponent(ship.id)}`
+    // Send temp keypair pubkey as the wallet param — this becomes the player ID
+    // on the backend, which equals the pubkey we registered on-chain, so
+    // recordKill can use player_id directly as the victim pubkey.
+    const chainKey = chain.playerKey?.toBase58() ?? publicKey?.toBase58()
+    const walletParam = chainKey ? `&wallet=${encodeURIComponent(chainKey)}` : ''
+    const url = `${WS_URL}?name=${encodeURIComponent(name)}&ship=${encodeURIComponent(ship.id)}${walletParam}`
     const ws  = new WebSocket(url)
     wsRef.current = ws
     ws.onerror  = () => setPhase('error')
     ws.onclose  = () => { if (!deadRef.current) setPhase('error') }
     ws.onmessage = (ev) => handleMsg(JSON.parse(ev.data))
-  }, [ship.id, handleMsg])
+    // Join the on-chain room in parallel with the WS handshake.
+    joinOnChainRoom().catch(console.error)
+  }, [ship.id, handleMsg, publicKey, initialPrompt, chain, joinOnChainRoom])
 
   useEffect(() => () => { wsRef.current?.close() }, [])
 
@@ -437,7 +493,8 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
 
   // ── name input ───────────────────────────────────────────────────────────────
   if (phase === 'name_input') {
-    const canLaunch = nameInput.trim().length > 0
+    const walletConnected = !!publicKey
+    const canLaunch = nameInput.trim().length > 0 && walletConnected
     return (
       <div className="w-screen h-screen bg-[#020408] flex items-center justify-center">
         <div style={{ animation: 'appear 0.4s ease forwards' }}
@@ -452,6 +509,19 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
               style={{ fontFamily: 'Orbitron', background: 'linear-gradient(135deg,#06b6d4,#8b5cf6)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
               PRE-FLIGHT BRIEFING
             </h2>
+          </div>
+
+          {/* wallet connect */}
+          <div className="w-full flex flex-col gap-2">
+            <label className="text-[8px] tracking-[0.45em]" style={{ fontFamily: 'Orbitron', color: '#ffffff25' }}>
+              PILOT IDENTITY
+            </label>
+            <WalletButton />
+            {!walletConnected && (
+              <p className="text-[8px] tracking-wider" style={{ fontFamily: 'Orbitron', color: '#ffffff20', letterSpacing: '0.2em' }}>
+                Wallet address is your unique player ID
+              </p>
+            )}
           </div>
 
           {/* ship badge */}
@@ -523,7 +593,7 @@ export default function MultiplayerGame({ gameState, setScreen }: Props) {
             </button>
             <button
               disabled={!canLaunch}
-              onClick={() => connect(nameInput.trim())}
+              onClick={() => launchGame(nameInput.trim())}
               className="flex-1 py-2.5 rounded text-xs tracking-widest font-bold disabled:opacity-40 transition-all duration-200"
               style={{ fontFamily: 'Orbitron', background: 'linear-gradient(135deg,#06b6d4,#8b5cf6)', color: '#020408',
                 boxShadow: canLaunch ? '0 0 24px rgba(139,92,246,0.35)' : 'none' }}>
