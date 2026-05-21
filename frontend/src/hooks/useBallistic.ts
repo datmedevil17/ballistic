@@ -116,17 +116,32 @@ export function useBallistic() {
       tx.add(noopIx())
       tx.sign(kp)
       const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true })
-      await conn.confirmTransaction(
+      const result = await conn.confirmTransaction(
         { blockhash, lastValidBlockHeight, signature: sig },
         opts.commitment ?? (opts.ephemeral ? 'processed' : 'confirmed'),
       )
+      // Transaction landed but failed on-chain — fetch logs for real error
+      if (result.value.err) {
+        const txInfo = await conn.getTransaction(sig, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        }).catch(() => null)
+        const logs = txInfo?.meta?.logMessages ?? []
+        console.error('[ballistic] tx failed:', JSON.stringify(result.value.err))
+        if (logs.length) console.error('[ballistic] logs:\n' + logs.join('\n'))
+        return null
+      }
       if (opts.label) dispatchTxToast({ label: opts.label, sig, ephemeral: !!opts.ephemeral })
       return sig
     } catch (err) {
-      console.error('[ballistic] tx failed:', err)
+      // Extract logs from SendTransactionError when available
+      const logs = (err as any)?.logs as string[] | undefined
+      console.error('[ballistic] tx failed:', err instanceof Error ? err.message : JSON.stringify(err))
+      if (logs?.length) console.error('[ballistic] logs:\n' + logs.join('\n'))
       return null
     }
   }, [connection])
+
 
   // After delegating an account, ping the ER to trigger lazy account reload.
   const pingEr = useCallback(async (pda: PublicKey) => {
@@ -321,6 +336,36 @@ export function useBallistic() {
     }
   }, [getProgram])
 
+  const fetchRoom = useCallback(async (roomId: number): Promise<{
+    status: 'Lobby' | 'Active' | 'Ended'
+    creator: string
+    players: { pubkey: string; kills: number; score: number; lives: number; alive: boolean; rewardsCredited: boolean }[]
+  } | null> => {
+    const prog = getProgram()
+    if (!prog) return null
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('game_room'), new BN(roomId).toArrayLike(Buffer as any, 'le', 8)],
+      PROGRAM_ID,
+    )
+    try {
+      const data = await prog.account.gameRoom.fetch(pda)
+      const key  = Object.keys(data.status)[0]
+      const status = (key.charAt(0).toUpperCase() + key.slice(1)) as 'Lobby' | 'Active' | 'Ended'
+      return {
+        status,
+        creator: data.creator.toBase58(),
+        players: (data.players as any[]).map(p => ({
+          pubkey:          p.pubkey.toBase58(),
+          kills:           Number(p.kills),
+          score:           Number(p.score),
+          lives:           Number(p.lives),
+          alive:           p.alive,
+          rewardsCredited: p.rewardsCredited,
+        })),
+      }
+    } catch { return null }
+  }, [getProgram])
+
   return {
     playerKey,
     progReady,
@@ -344,5 +389,6 @@ export function useBallistic() {
     // Rewards
     claimRewards,
     fetchPendingRewards,
+    fetchRoom,
   }
 }

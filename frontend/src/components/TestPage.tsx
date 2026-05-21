@@ -22,6 +22,25 @@ export default function TestPage({ setScreen }: { setScreen: (s: Screen) => void
   const [victimPubkey, setVictimPubkey] = useState('')
   const consoleEndRef = useRef<HTMLDivElement>(null)
 
+  type RoomInfo = Awaited<ReturnType<typeof b.fetchRoom>>
+  const [roomInfo,  setRoomInfo]  = useState<RoomInfo>(null)
+  const [fetching,  setFetching]  = useState(false)
+  const fetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Debounced auto-fetch whenever Room ID changes
+  useEffect(() => {
+    if (fetchTimer.current) clearTimeout(fetchTimer.current)
+    const rid = parseInt(roomId)
+    if (!rid || !b.progReady) { setRoomInfo(null); return }
+    fetchTimer.current = setTimeout(async () => {
+      setFetching(true)
+      const info = await b.fetchRoom(rid).catch(() => null)
+      setRoomInfo(info)
+      setFetching(false)
+    }, 700)
+    return () => { if (fetchTimer.current) clearTimeout(fetchTimer.current) }
+  }, [roomId, b.progReady]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const push = (msg: string, level: LogEntry['level'] = 'info') => {
     const now = new Date()
     const ts = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}.${now.getMilliseconds().toString().padStart(3, '0')}`
@@ -249,6 +268,63 @@ export default function TestPage({ setScreen }: { setScreen: (s: Screen) => void
               }}
               placeholder="1"
             />
+            {/* Room info panel */}
+            {fetching && (
+              <div style={{ fontSize: 10, color: '#3a5a7a', letterSpacing: 1, padding: '6px 0' }}>fetching room…</div>
+            )}
+            {!fetching && roomInfo && (() => {
+              const statusColor = roomInfo.status === 'Active' ? '#44dd88' : roomInfo.status === 'Ended' ? '#ff4455' : '#ffaa33'
+              const canStart    = roomInfo.status === 'Lobby' && roomInfo.players.length >= 2
+              return (
+                <div style={{ border: '1px solid #1a3a5a', background: '#060f18', padding: '10px', marginBottom: 8 }}>
+                  {/* status row */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <span style={{ color: statusColor, fontWeight: 700, letterSpacing: 2, fontSize: 11 }}>
+                      ● {roomInfo.status.toUpperCase()}
+                    </span>
+                    <span style={{ fontSize: 10, color: canStart ? '#44dd88' : roomInfo.status === 'Lobby' ? '#ffaa33' : '#3a5a7a' }}>
+                      {roomInfo.status === 'Lobby' && (canStart ? 'READY TO START' : 'NEED ≥2 PLAYERS')}
+                      {roomInfo.status === 'Active' && 'IN PROGRESS'}
+                      {roomInfo.status === 'Ended'  && 'GAME OVER'}
+                    </span>
+                  </div>
+                  {/* meta */}
+                  <div style={{ fontSize: 10, color: '#3a5a7a', marginBottom: 6 }}>
+                    HOST&nbsp;<span style={{ color: '#5577aa' }}>{roomInfo.creator.slice(0,8)}…{roomInfo.creator.slice(-4)}</span>
+                    &nbsp;·&nbsp;{roomInfo.players.length} player{roomInfo.players.length !== 1 ? 's' : ''}
+                  </div>
+                  {/* player rows */}
+                  {roomInfo.players.length === 0
+                    ? <div style={{ fontSize: 10, color: '#2a4a6a' }}>no players on-chain yet</div>
+                    : roomInfo.players.map((p, i) => (
+                      <div key={i} style={{
+                        display: 'flex', alignItems: 'center', gap: 6,
+                        padding: '3px 6px', marginBottom: 3,
+                        background: '#080f18', border: '1px solid #0f1e2a', fontSize: 10,
+                      }}>
+                        <span style={{ color: p.alive ? '#44dd88' : '#ff4455' }}>{p.alive ? '●' : '○'}</span>
+                        <span style={{ color: '#6688aa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {p.pubkey.slice(0,8)}…{p.pubkey.slice(-4)}
+                        </span>
+                        {p.pubkey === roomInfo.creator && (
+                          <span style={{ color: '#ffaa33', fontSize: 9, letterSpacing: 1, border: '1px solid #ffaa3350', padding: '0 4px' }}>HOST</span>
+                        )}
+                        <span style={{ color: '#3a6a8a' }}>{p.kills}K · {p.lives}L</span>
+                        {p.rewardsCredited && <span style={{ color: '#44dd8880' }}>✓</span>}
+                      </div>
+                    ))
+                  }
+                  <button
+                    onClick={async () => { setFetching(true); const i = await b.fetchRoom(parseInt(roomId)).catch(() => null); setRoomInfo(i); setFetching(false) }}
+                    style={{ marginTop: 6, width: '100%', background: 'none', border: '1px solid #1a2a3a', color: '#3a5a7a', padding: '2px 0', cursor: 'pointer', fontFamily: 'inherit', fontSize: 10, letterSpacing: 1 }}
+                  >↻ REFRESH</button>
+                </div>
+              )
+            })()}
+            {!fetching && !roomInfo && b.progReady && parseInt(roomId) > 0 && (
+              <div style={{ fontSize: 10, color: '#2a4a6a', marginBottom: 8 }}>no room found at id {roomId}</div>
+            )}
+
             <label style={{ fontSize: 11, color: '#6688aa', display: 'block', marginBottom: 4 }}>Victim Pubkey (recordKill)</label>
             <input
               value={victimPubkey}
